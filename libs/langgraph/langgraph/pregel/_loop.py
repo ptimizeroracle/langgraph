@@ -117,6 +117,7 @@ from langgraph.pregel._io import (
     map_output_values,
     read_channels,
 )
+from langgraph.pregel._log import logger
 from langgraph.pregel._messages import ensure_message_ids
 from langgraph.pregel._read import PregelNode
 from langgraph.pregel._utils import get_new_channel_versions, is_xxh3_128_hexdigest
@@ -907,10 +908,41 @@ class PregelLoop:
                         "Cannot use Command(resume=...) without checkpointer"
                     )
 
-                if resume_is_map := (
-                    isinstance(resume, dict)
-                    and all(is_xxh3_128_hexdigest(k) for k in resume)
-                ):
+                resume_is_map = isinstance(resume, dict) and all(
+                    is_xxh3_128_hexdigest(k) for k in resume
+                )
+                # Shape-only detection silently swallowed resumes that matched
+                # no pending interrupt id (e.g. HITL payloads keyed by
+                # uuid4().hex), leaving the thread interrupted with no error
+                # (#8836). Fall back to verbatim delivery only when exactly
+                # one interrupt is resumable thread-wide AND no key targets
+                # it. The unpoisoned id count guards against two states where
+                # _pending_interrupts() under-reports: stale same-task RESUME
+                # writes hiding sequential interrupts, and nested subgraph
+                # interrupts surfacing one id per parent task. Anything
+                # ambiguous stays a map so partial maps, sequential
+                # same-node interrupts, and subgraph resumes keep their
+                # current semantics.
+                if resume_is_map:
+                    pending = self._pending_interrupts()
+                    all_interrupt_ids = {
+                        interrupt_.id
+                        for _, write_type, value in self.checkpoint_pending_writes
+                        if write_type == INTERRUPT
+                        for interrupt_ in value
+                    }
+                    if (
+                        len(pending) == 1
+                        and not set(resume) & pending
+                        and len(all_interrupt_ids) == 1
+                    ):
+                        logger.warning(
+                            "Command(resume=...) dict with 32-hex keys matched no "
+                            "pending interrupt id; delivering it verbatim as the "
+                            "resume value."
+                        )
+                        resume_is_map = False
+                if resume_is_map:
                     self.config[CONF][CONFIG_KEY_RESUME_MAP] = resume
                 else:
                     if len(self._pending_interrupts()) > 1:
